@@ -1,0 +1,517 @@
+---
+title: "UT Pandemic Model Using Apple Data"
+author: "Kevin M Hannay"
+date: "5/21/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(rstan)
+library(dplyr)
+library(ggplot2)
+library(lubridate)
+library(lme4)
+library(rstanarm)
+library(directlabels)
+library(cowplot)
+library(stringr)
+library(readr)
+library(tidyr)
+
+
+## For running parallel chains in Stan
+
+options(mc.cores = parallel::detectCores())
+
+theme_set(theme_half_open())
+
+## Global Variables
+applemaps_data_path="./data/applemobilitytrends-2020-05-24.csv"
+
+##Run the Stan MCMC. 
+runModel<-FALSE #set to true to re-run the mcmc for the model
+
+
+
+```
+
+To start I we need to process the mortality data and the apple movement data. The mortality data processing was provided by the [UT Pandemic Modeling Consortium](https://covid-19.tacc.utexas.edu/), and I will be employing the same multilevel model they use to generate daily mortality predictions. 
+
+The idea of this document is to show how to use the open-source [apple maps](https://www.apple.com/covid19/mobility) mobility data as a predictor in the pandemic death prediction model. 
+
+
+# Daily Mortality Data
+
+To get the morbidity data I will use the [code](https://github.com/UT-Covid/USmortality) provided by the UT team. First, they read-in and process the NYT data.
+
+```{r warning=FALSE, error=FALSE, message=FALSE}
+## State abbreviations and fips codes
+state_abbr <- read.csv("./data/state_fips_abbr.csv", stringsAsFactors = FALSE)
+
+## Population by state
+uspop <- read.csv('./data/uspop.csv', stringsAsFactors = FALSE)
+
+
+
+###############################################################################
+                                        #               NYT data              #
+###############################################################################
+
+
+## Data from New York Times -- https://github.com/nytimes/covid-19-data
+nyt_raw <- read_csv('https://raw.githubusercontent.com/nytimes/covid-19-data/master/us-counties.csv')
+
+nyt <- nyt_raw %>%
+  filter(state %in% state_abbr$Name) %>% #Choose only 50 states + DC
+  mutate(date = ymd(date)) %>% 
+  group_by(state, date) %>%
+  summarize(cumulative_deaths=sum(deaths)) %>% #Cumulative deaths
+  ungroup() %>%
+  merge(uspop, by.x = 'state', by.y = 'location') %>% #Add population numbers
+  arrange(state, date) %>%
+  rename(population = Pop_Est_2019) %>%
+  group_by(state) %>%
+  mutate(deaths = diff(c(0,cumulative_deaths))) %>% #Deaths per day
+  ungroup() %>%
+  mutate(deaths_per_cap = deaths/population,
+         cumulative_deaths_per_cap = cumulative_deaths/population) #per-capita
+
+
+## When does mortality rate exceed 3 deaths per 10 million -> start of
+## epidemiological timeline for our model
+threshold_day_nyt <- nyt %>%
+  group_by(state) %>%
+  summarize(threshold_day = date[min(which(cumulative_deaths_per_cap >= 0.3/1e6))])
+
+## if a state hasn't reached this threshold day yet, don't include it
+## in the model
+keep_states_nyt <- threshold_day_nyt %>%
+  filter(!is.na(threshold_day)) %>%
+  pull(state)
+
+nyt <- nyt %>%
+  filter(state %in% keep_states_nyt)
+
+## use the threshold_day variable to get the time counter, then remove it
+nyt = nyt %>% merge(threshold_day_nyt)
+
+nyt = nyt %>%
+  mutate(days_since_thresh = as.numeric(ymd(date) - ymd(threshold_day))) %>%
+  select(-threshold_day) %>%
+  filter(deaths >= 0, days_since_thresh >= 0)
+
+
+
+```
+
+Now for the JHU data....
+
+```{r}
+## Data from Johns Hopkins U. -- https://github.com/CSSEGISandData/COVID-19
+## Note that these data contain *cumulative deaths*
+jhu_raw <- read_csv("https://raw.githubusercontent.com/CSSEGISandData/COVID-19/master/csse_covid_19_data/csse_covid_19_time_series/time_series_covid19_deaths_US.csv")
+
+
+
+## Make this data "longer", and create YYYY-MM-DD dates
+jhu <- jhu_raw %>%
+  pivot_longer(cols = ends_with("20"),
+               names_to = "date_mdy",
+               values_to = "cumulative_deaths") %>%
+  mutate(date_ymd = mdy(date_mdy) %>% ymd())
+
+
+
+## Select columns
+jhu <- jhu %>%
+  select(date = date_ymd, #Select certain columns
+         county = Admin2,
+         state = Province_State,
+         fips = FIPS,
+         cumulative_deaths,
+         Population) %>%
+  filter(state %in% state_abbr$Name) %>% #Only US states + DC
+  group_by(state, date) %>%              #Aggregate by state
+  summarize(cumulative_deaths = sum(cumulative_deaths),
+            population = sum(Population)) %>%
+  ungroup() %>%
+  group_by(state) %>%
+  mutate(deaths = diff(c(0,cumulative_deaths))) %>% #Daily deaths
+  mutate(deaths_per_cap = deaths/population,        #Per-capita deaths
+         cumulative_deaths_per_cap = cumulative_deaths/population)
+
+
+# Threshold date as defined above
+threshold_day_jhu <- jhu %>%
+  group_by(state) %>%
+  summarize(threshold_day = date[min(which(cumulative_deaths_per_cap >= 0.3/1e6))])
+
+keep_states_jhu <- threshold_day_jhu %>%
+  filter(!is.na(threshold_day)) %>%
+  pull(state)
+
+jhu <- jhu %>%
+  filter(state %in% keep_states_jhu)
+
+# use the threshold_day variable to get the time counter, then remove it
+jhu <- jhu %>% merge(threshold_day_jhu)
+
+## Only data for after the threshold
+jhu <- jhu %>%
+  mutate(days_since_thresh = as.numeric(ymd(date) - ymd(threshold_day))) %>%
+  select(-threshold_day) %>%
+  filter(deaths >= 0, days_since_thresh >= 0) %>%
+  select(state, date, cumulative_deaths, population, deaths, deaths_per_cap,
+         cumulative_deaths_per_cap, days_since_thresh)
+
+```
+
+```{r}
+## Stack data sources
+mortality_both <- rbind(
+  jhu %>% mutate(Source = "JHU"),
+  nyt %>% mutate(Source = "NYT")
+)
+```
+
+
+To get an idea of what is in this data set, let's examine just the data from Texas. 
+
+
+```{r}
+## Choose a state
+mystate <- "Texas"
+
+data_both_mystate <- mortality_both %>% filter(state == mystate) %>% arrange(date, Source)
+
+tail(data_both_mystate, 4)
+
+```
+
+Here is a quick plot of the daily deaths in Texas for the two data sources used (NYT and JHU). 
+
+
+```{r}
+ggplot(data=data_both_mystate, aes(x=date, y=deaths, color=Source))+geom_point()+labs(title="Daily Deaths in Texas")+geom_line()
+```
+
+We have some obvious periodicity in this data, and as we can see the results are very noisy. 
+
+
+```{r echo=FALSE}
+#clean up the workspace 
+rm(jhu_raw, nyt_raw, threshold_day_jhu, threshold_day_nyt, keep_states_jhu, keep_states_nyt)
+```
+
+## Apple Mobility Data
+
+We want to try and use this data to extract out a measurement(s) of the strength of the social distancing going on in that state at any particular time. The original work uses a closed source data set (SafeGraph), but the authors suggest that the freely available apple mobility data might be usuable as a substitute. From the figures it looks like the SafeGraph) data set has more categories to fine tune the exact nature of the social distancing being implemented (school/college/etc). 
+
+```{r warning=FALSE}
+apple_mob <- readr::read_csv(applemaps_data_path)
+apple_mob <- apple_mob %>% filter(country=="United States") #get state level data
+apple_mob<-apple_mob %>% tidyr::gather(date, SocialDist, `2020-01-13`:ncol(.)) %>% select("region", "geo_type", "sub-region", "transportation_type", "date", "SocialDist") %>% rename(state=`sub-region`) %>% arrange(transportation_type, state, date)
+apple_mob$date<-as.Date(apple_mob$date)
+```
+
+One thing to note about this data is that the three transportation classes are only available at the city level. At the county and state levels driving is the only transportation class available. The walking and transit data are also not available for all of the states at all. 
+
+```{r}
+table(apple_mob$geo_type, apple_mob$transportation_type)
+```
+
+For now let's focus on the county level and driving as the city level has only a few cities per state. 
+
+
+The below shows the number of counties reporting for the data set: 
+```{r}
+apple_mob %>% filter(geo_type=="county") %>%  group_by(state, date) %>% summarise(num.counties=n()) %>% filter(date>=as.Date("2020-05-22")) %>% select(state, num.counties) %>% arrange(desc(num.counties))
+
+```
+
+
+This data provides time series for three movement types (driving, transit and walking) for each day. I will use this as a proxy to measure the **social distancing** score for a given state. First, lets take a look at these three measures time series for Texas.
+
+```{r}
+apple_mob_texas <- apple_mob %>% filter(state=="Texas") %>% group_by(date, transportation_type) %>% summarise(SocialDist=median(SocialDist)) %>% na.omit()
+ggplot(apple_mob_texas, aes(x=date, y=SocialDist, col=transportation_type))+geom_point()+geom_line()+labs(title="Social Distancing Measures in Texas")
+
+```
+We can see the impact of the social distancing measures on these three measurements during the shut-down. We can also start to see the effects of the re-opening phases show up in this data set. One issue we can see right away with this data set is that these three measurements are highly correlated. 
+
+The original paper introduces a lag kernel to find the distancing metrics. They use a Gaussian kernel centered 23.5 days in the past with a standard deviation of 6 days. This is based on some published estimates of the lag-time between contraction to death.
+
+
+$$
+\tilde{s}_{i t, j}=\sum_{l=1}^{L} w_{l} s_{i, t-l, j}
+$$
+
+I will implement the same kernel to introduce the time-lag on the apple maps data. 
+
+
+```{r}
+gKernelTS <- function(my_ts) {
+  smoothed_ts<-rep(0, length(my_ts))
+  L=length(my_ts)
+  
+  #Deal with any na's in the social dist timeseries by imputation of the last value
+  
+  for (i in 2:L) {
+    if (is.na(my_ts[i])){
+      my_ts[i]=my_ts[i-1]
+    }
+  }
+  
+  #Now do the timelag and Gaussian Kernel
+  
+  for (g in 1:L) {
+    r<-1:g #days up until now
+    w<-dnorm(r,mean=g-23.5,sd=6.0) #Gaussian with peak 23.5 days before
+    smoothed_ts[g]<-sum(w*my_ts[1:g])
+  }
+  return(smoothed_ts)
+}
+
+#Create a score by state for the three categories
+apple_mob_state<- apple_mob %>%  group_by(state, transportation_type, date) %>% summarise(SocialDist=median(SocialDist, na.rm=TRUE))
+
+#Now compute the measure for each state and transportation type
+apple_mob_state<- apple_mob_state %>% arrange(state, transportation_type, date) %>% group_by(state, transportation_type) %>% mutate(SocialDist.timelag=gKernelTS(SocialDist), SocialDist.org=SocialDist) 
+
+apple_mob_state<-apple_mob_state %>% select(date,state,transportation_type,SocialDist.timelag)
+
+```
+
+Let's plot our social distancing impact at each date for the three categories in Texas. 
+
+
+```{r}
+apple_mob_texas <- apple_mob_state %>% filter(state=="Texas") 
+ggplot(apple_mob_texas, aes(x=date, y=SocialDist.timelag, col=transportation_type))+geom_point()+geom_line()+labs(title="Social Distancing Measures in Texas Time Lag")
+```
+
+Now we need to extract our social distancing covariates for each state and date. 
+
+
+```{r}
+apple_mob_state<- apple_mob_state %>% tidyr::pivot_wider(names_from=transportation_type, values_from=SocialDist.timelag)
+```
+
+## Merging the Data Together
+
+Now lets put the morbitity data and the social distancing data together into the same data frame. Notice that we only make use of the jhu mortatlity data. 
+
+```{r}
+us_states <- jhu
+
+## Only 50 states + DC
+us_states <- us_states %>% filter(state %in% state_abbr$Name) %>% mutate(date = ymd(date))
+
+
+## Create a new df with covariates
+us_states_covariates <- us_states %>% left_join(apple_mob_state, by=c("state", "date")) %>% arrange(state, date) 
+us_states_covariates$weekends=ifelse(wday(us_states_covariates$date)>5.0,1,0)
+
+## Remove the transit and walking columns for now as they are missing for the less populated states
+us_states_covariates$transit<-NULL
+us_states_covariates$walking<-NULL
+
+## The apple maps data will always be (at least) one day behind the jhu data
+
+# Get rid on any residual missing values from the data
+us_states_covariates<-na.omit(us_states_covariates)
+
+```
+
+
+## Running the Stan Model
+
+Now it is time to run the multilevel model to predict the daily death rates. Notice we define a group based on the states and fit a second order polynomial model. This is exactly the same structure as the UT Pandemic model, although I switched out the social distancing measures. 
+
+```{r}
+nburn <- 2000 #2000
+niter <- 2000 #2000
+
+
+
+if (runModel==TRUE) {
+
+glm3stan <- stan_glmer.nb(
+  deaths ~ poly(days_since_thresh, 2) * (driving + weekends) +(poly(days_since_thresh, 2) | state),
+  offset = log(population), data=us_states_covariates,
+  chains = 3, iter = nburn + niter, warmup = nburn)
+
+save(glm3stan, file="stanModel_applemaps.RData")
+
+} else {
+  load(file="./stanModel_applemaps.RData")
+}
+```
+
+
+Predict the posterior for the training data. 
+
+```{r}
+
+ypost3 <- posterior_predict(glm3stan, newdata = us_states_covariates)
+
+```
+
+
+Now we need to generate our predictions for the future. To do so we need to generate the input data for our model. The below just creates a dataframe to store the prjections in. 
+
+
+```{r}
+
+
+## Vector of states
+all_states <- unique(us_states$state)
+
+## No. days into the future
+moreDays <- 14
+
+us_futureList <- vector("list", moreDays)
+
+## Create dataframe of future dates for all state
+for (i in 1:length(all_states)) {
+
+
+  stateLast <- us_states %>% arrange(state, date) %>% filter(state == all_states[i]) %>% tail(1)
+
+  futureI <- NULL
+
+  for (j in 1:moreDays) {
+    futureI <- rbind(futureI, stateLast %>% mutate(date = date + j, days_since_thresh = days_since_thresh + j)) 
+  }
+
+  us_futureList[[i]] <- futureI
+
+}
+
+us_future <- plyr::rbind.fill(us_futureList) %>% arrange(state, date)
+
+# D.C was causing issues in the projections so I removed it
+us_future <- us_future %>% filter(state!="District of Columbia")
+
+```
+
+Given the *time-lag* we can estimate the social distancing measures for the next $\approx 20$ days using the data up until this point. 
+
+```{r}
+
+
+us_future$driving <- NA; #init them as NA
+
+for (i in 1:nrow(us_future)) {
+  
+  #Get the past time-series of the raw driving scores for each state sorted by days
+  state_timeseries<- apple_mob %>%  
+    filter(state==us_future$state[i], transportation_type=="driving") %>% 
+    group_by(date) %>% 
+    summarise(SocialDist=median(SocialDist, na.rm=TRUE)) %>% 
+    select(date, SocialDist) %>% 
+    arrange(date)
+  
+  
+  #Fill in any missing values as the last non NA values (May 11-12 will cause problems otherwise)
+  L=length(state_timeseries$SocialDist)
+  for (j in 2:L) {
+    if (is.na(state_timeseries$SocialDist[j])){
+      state_timeseries$SocialDist[j]=state_timeseries$SocialDist[j-1]
+    }
+  }
+  
+  r<-1:L #days up until now
+  idx=as.numeric(us_future$date[i]-max(state_timeseries$date)) #this gives us which day we are on
+  w<-dnorm(r,mean=L+idx-23.5,sd=6.0) #Gaussian with peak 23.5 days before the current day
+  us_future$driving[i]<-sum(w*state_timeseries$SocialDist)
+  
+  
+}
+
+us_future_covariates <- na.omit(us_future)
+
+us_future_covariates$weekends=ifelse(wday(us_future_covariates$date)>5.0,1,0)
+```
+
+Now we can plug in this data to our fit model to get the credible intervals for the daily deaths by state. 
+
+
+```{r}
+
+ypost_future <- posterior_predict(glm3stan, newdata = us_future_covariates)
+
+us_future_covariates$yhat_future <- apply(ypost_future, 2, quantile, probs = 0.5)
+us_future_covariates$ylo_future <- apply(ypost_future, 2, quantile, probs = 0.025)
+us_future_covariates$yhi_future <- apply(ypost_future, 2, quantile, probs = 0.975)
+
+```
+
+Let's make a plot of the data and forecast. 
+
+```{r}
+stateChoice<-"Texas"
+us_future_top <- us_future_covariates %>% filter(state==stateChoice)
+us_past_choice <- us_states_covariates %>% filter(state==stateChoice)
+ggplot(us_future_top, aes(x=date, y=yhat_future, color=state))+
+  geom_point(color="blue")+
+  geom_line(color="blue")+
+  labs(title="Model Daily Deaths Projections", subtitle = stateChoice)+
+  geom_ribbon(data=us_future_top,aes(ymin=ylo_future,ymax=yhi_future),alpha=0.3, color="lightblue", fill="lightblue")+
+  ylab("Deaths Per Day")+
+  xlab("Date")+
+  geom_point(data=us_past_choice, aes(x=date, y=deaths), color="black")
+
+```
+
+Let's compare this with the model using the full SafeGraph data set. 
+
+```{r}
+full_model_projections <- read_csv('https://raw.githubusercontent.com/UT-Covid/USmortality/master/forecasts/UT-COVID19-states-forecast-latest.csv')
+
+
+predictionPlot <- function(stateChoice) {
+us_future_top <- us_future_covariates %>% filter(state==stateChoice)
+us_past_choice <- us_states_covariates %>% filter(state==stateChoice)
+
+full_model_choice <- full_model_projections %>% filter(state==stateChoice, date>=today(), date <= max(us_future_top$date))
+ggplot(us_future_top, aes(x=date, y=yhat_future, color=state))+
+  geom_point(color="blue")+
+  geom_line(color="blue")+
+  labs(title="Model Daily Deaths Projections", subtitle = stateChoice)+
+  geom_ribbon(data=us_future_top,aes(x=date, ymin=ylo_future,ymax=yhi_future),alpha=0.3, color="lightblue", fill="lightblue")+
+  ylab("Deaths Per Day")+
+  xlab("Date")+
+  geom_point(data=us_past_choice, aes(x=date, y=deaths), color="black")+
+  geom_point(data=full_model_choice, aes(x=date, y=daily_deaths_est), color="darkgreen")+
+  geom_line(data=full_model_choice, aes(x=date, y=daily_deaths_95CI_lower), color="darkgreen")+
+  geom_line(data=full_model_choice, aes(x=date, y=daily_deaths_95CI_upper), color="darkgreen")
+ 
+} 
+  
+```
+```{r}
+predictionPlot("Texas")
+```
+
+So we can see that the (full model) using the SafeGraph data predicts almost the same median of the posterior distribution but with a narrower credible interval for the prediction. 
+
+Some small differences exist between the models as well. For example, if we look at the projections for New Jersey, we can see that the apple maps data predicts a faster decay. I expect this is because the apple maps data is only looking at the driving component to measure the effectiveness of Social Distancing. In New Jersey public transportation is likely a more significant part of the social distancing effectiveness than in Texas. The SafeGraph data gives a more fine grained examination of social distancing then we can get from the apple maps data. 
+
+```{r}
+predictionPlot("New Jersey")
+```
+
+
+
+
+
+
+
+
+
+
+
+
